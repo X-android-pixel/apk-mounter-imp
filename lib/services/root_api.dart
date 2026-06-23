@@ -13,24 +13,24 @@ module_dir="$(dirname "$0")"
 if [ "${module_dir#"/"}" = "$module_dir" ] && command -v readlink >/dev/null 2>&1; then
   module_dir="$(dirname "$(readlink -f "$0")")"
 fi
-if [ "${module_dir#"/"}" = "$module_dir" ]; then
-  module_dir="/data/adb/modules/${package_name}-mounter"
-fi
 
 base_dir="$module_dir"
-mkdir -p "$module_dir"
 
-log="$module_dir/log.txt"
-rm -f "$log"
-exec >> "$log" 2>&1
+# Logging (optional, can be disabled for more stealth)
+# log="$module_dir/log.txt"
+# exec >> "$log" 2>&1
 
-base_path="$base_dir/$package_name.apk"
+base_path="$base_dir/base.apk"
 
 until [ "$(getprop sys.boot_completed)" = 1 ]; do sleep 3; done
 until [ -d "/sdcard/Android" ]; do sleep 1; done
 
-grep "$package_name" /proc/mounts | while read -r line; do
-  echo "$line" | cut -d " " -f 2 | sed "s/apk.*/apk/" | xargs -r umount -l
+# Persistent unmount to ensure no stale mounts
+for i in 1 2 3; do
+  grep "$package_name" /proc/mounts | while read -r line; do
+    echo "$line" | cut -d " " -f 2 | sed "s/apk.*/apk/" | xargs -r umount -l
+  done
+  sleep 1
 done
 
 waited=0
@@ -91,7 +91,7 @@ chcon u:object_r:apk_data_file:s0 "$base_path"
 mount -o bind "$base_path" "$stock_path"
 ''';
 
-  static const String _modulePropTemplate = r'''id=__PKG_NAME__-mounter
+  static const String _modulePropTemplate = r'''id=__MODULE_ID__
 name=__LABEL__ Mounter
 version=__VERSION__
 versionCode=0
@@ -99,6 +99,21 @@ author=APK Mounter
 description=Mounts the patched APK on top of the original one (Implementation inspired by Morphe Manager)
 ''';
 
+  String _getModuleId(String packageName) {
+    const int offsetBasis = 2166136261;
+    const int prime = 16777619;
+
+    int hash = offsetBasis;
+    for (int i = 0; i < packageName.length; i++) {
+      hash ^= packageName.codeUnitAt(i);
+      hash = (hash * prime) & 0xFFFFFFFF;
+    }
+    return 'am_${hash.toRadixString(16)}';
+  }
+
+  String _getModulePath(String packageName) {
+    return '$_modulesDirPath/${_getModuleId(packageName)}';
+  }
 
   Future<bool> isRooted() async {
     try {
@@ -158,22 +173,33 @@ description=Mounts the patched APK on top of the original one (Implementation in
 
   Future<bool> isAppInstalled(String packageName) async {
     if (packageName.isNotEmpty) {
-      return fileExists('$_modulesDirPath/$packageName-mounter/service.sh');
+      // Check both new hashed path and legacy path
+      final String modulePath = _getModulePath(packageName);
+      final String legacyPath = '$_modulesDirPath/$packageName-mounter';
+      return await fileExists('$modulePath/service.sh') || await fileExists('$legacyPath/service.sh');
     }
     return false;
   }
 
   Future<List<String>> getInstalledApps() async {
-    final List<String> apps = List.empty(growable: true);
+    final Set<String> apps = {};
     try {
       final String? res = await Root.exec(cmd: 'ls $_modulesDirPath');
       if (res != null) {
         final List<String> list = res.split('\n');
         for (var dir in list) {
           dir = dir.trim();
+          if (dir.isEmpty) continue;
+
           if (dir.endsWith('-mounter')) {
-            final pkg = dir.substring(0, dir.length - '-mounter'.length);
-            apps.add(pkg);
+            // Legacy format
+            apps.add(dir.substring(0, dir.length - '-mounter'.length));
+          } else if (dir.startsWith('am_')) {
+            // New hashed format, try to read package_name marker
+            final String? pkg = await Root.exec(cmd: 'cat $_modulesDirPath/$dir/package_name 2>/dev/null');
+            if (pkg != null && pkg.trim().isNotEmpty) {
+              apps.add(pkg.trim());
+            }
           }
         }
       }
@@ -182,17 +208,28 @@ description=Mounts the patched APK on top of the original one (Implementation in
         print(e);
       }
     }
-    return apps;
+    return apps.toList();
   }
 
   Future<void> uninstall(String packageName) async {
-    final String modulePath = '$_modulesDirPath/$packageName-mounter';
-    
+    final String modulePath = _getModulePath(packageName);
+    final String legacyPath = '$_modulesDirPath/$packageName-mounter';
+
     final String script = r'''
-          grep __PKG_NAME__ /proc/mounts | while read -r line; do echo $line | cut -d " " -f 2 | sed "s/apk.*/apk/" | xargs -r umount -l; done
-          am force-stop __PKG_NAME__
+          # Persistent unmount
+          for i in 1 2 3; do
+            grep "__PKG_NAME__" /proc/mounts | while read -r line; do
+              echo "$line" | cut -d " " -f 2 | sed "s/apk.*/apk/" | xargs -r umount -l
+            done
+            sleep 0.5
+          done
+          am force-stop "__PKG_NAME__"
           rm -rf "__MODULE_PATH__"
-    '''.replaceAll('__PKG_NAME__', packageName).replaceAll('__MODULE_PATH__', modulePath);
+          rm -rf "__LEGACY_PATH__"
+    '''
+        .replaceAll('__PKG_NAME__', packageName)
+        .replaceAll('__MODULE_PATH__', modulePath)
+        .replaceAll('__LEGACY_PATH__', legacyPath);
 
     await Root.exec(cmd: script);
   }
@@ -209,13 +246,21 @@ description=Mounts the patched APK on top of the original one (Implementation in
     String label = '',
   }) async {
     try {
-      final String modulePath = '$_modulesDirPath/$packageName-mounter';
-      await Root.exec(cmd: 'mkdir -p $modulePath');
-      
+      final String modulePath = _getModulePath(packageName);
+      final String legacyPath = '$_modulesDirPath/$packageName-mounter';
+
+      // Clean up legacy module if it exists
+      await Root.exec(cmd: 'rm -rf "$legacyPath"');
+
+      await Root.exec(cmd: 'mkdir -p "$modulePath"');
+
+      // Create a marker file to store the package name for easier discovery
+      await Root.exec(cmd: "echo '$packageName' > $modulePath/package_name");
+
       await installPatchedApk(packageName, patchedFilePath);
       await _installModuleProp(packageName, version, label, modulePath);
       await _installServiceSh(packageName, version, modulePath);
-      
+
       await runMountScript(packageName);
       return true;
     } on Exception catch (e) {
@@ -228,10 +273,10 @@ description=Mounts the patched APK on top of the original one (Implementation in
 
   Future<void> _installModuleProp(String packageName, String version, String label, String modulePath) async {
     String content = _modulePropTemplate
-        .replaceAll('__PKG_NAME__', packageName)
+        .replaceAll('__MODULE_ID__', _getModuleId(packageName))
         .replaceAll('__VERSION__', version)
         .replaceAll('__LABEL__', label);
-    
+
     // Write content out securely
     await Root.exec(cmd: "cat << 'EOF' > $modulePath/module.prop\n$content\nEOF");
   }
@@ -240,14 +285,14 @@ description=Mounts the patched APK on top of the original one (Implementation in
     String content = _serviceShTemplate
         .replaceAll('__PKG_NAME__', packageName)
         .replaceAll('__VERSION__', version);
-    
+
     await Root.exec(cmd: "cat << 'EOF' > $modulePath/service.sh\n$content\nEOF");
     await setPermissions('0744', '', '', '$modulePath/service.sh');
   }
 
   Future<void> installPatchedApk(String packageName, String patchedFilePath) async {
-    final String modulePath = '$_modulesDirPath/$packageName-mounter';
-    final String newPatchedFilePath = '$modulePath/$packageName.apk';
+    final String modulePath = _getModulePath(packageName);
+    final String newPatchedFilePath = '$modulePath/base.apk';
     await Root.exec(
       cmd: 'cp "$patchedFilePath" "$newPatchedFilePath"',
     );
@@ -260,8 +305,8 @@ description=Mounts the patched APK on top of the original one (Implementation in
   }
 
   Future<void> runMountScript(String packageName) async {
-    final String patchedApk = '$_modulesDirPath/$packageName-mounter/$packageName.apk';
-    
+    final String patchedApk = '${_getModulePath(packageName)}/base.apk';
+
     final String script = r'''
       stock_path_data="$(pm path "__PKG_NAME__" | grep base | grep /data/app/ | head -n 1 | sed 's/package://g')"
       stock_path_fallback="$(pm path "__PKG_NAME__" | grep base | head -n 1 | sed 's/package://g')"
@@ -274,6 +319,13 @@ description=Mounts the patched APK on top of the original one (Implementation in
 
       if [ -n "$stock_path_res" ] && [ -f "$stock_path_res" ]; then
         chcon u:object_r:apk_data_file:s0 "__PATCHED_APK__"
+        # Persistent unmount to ensure no stale mounts before re-mounting
+        for i in 1 2 3; do
+          grep "__PKG_NAME__" /proc/mounts | while read -r line; do
+            echo "$line" | cut -d " " -f 2 | sed "s/apk.*/apk/" | xargs -r umount -l
+          done
+          sleep 0.5
+        done
         mount -o bind "__PATCHED_APK__" "$stock_path_res"
         am force-stop "__PKG_NAME__"
       fi
