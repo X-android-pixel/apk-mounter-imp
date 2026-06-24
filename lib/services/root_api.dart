@@ -32,9 +32,12 @@ unmount_package() {
             mnt_point=$(echo "$line" | cut -d " " -f 2)
             # Match only relevant paths in /data/app/
             if echo "$mnt_point" | grep -q "/data/app/"; then
+                [ -f "/proc/sys/fs/susfs/sus_kstat" ] && susfs add_sus_kstat "$mnt_point"
                 umount -l "$mnt_point"
             fi
         done
+        # Also cleanup intermediate mounts
+        umount -l /dev/.$package_name >/dev/null 2>&1
         sleep 0.5
     done
 }
@@ -91,6 +94,11 @@ fi
 
 chcon u:object_r:apk_data_file:s0 "$base_path"
 
+# Obfuscate mount source using an intermediate mount in /dev
+dev_path="/dev/.$package_name"
+touch "$dev_path"
+mount -o bind "$base_path" "$dev_path"
+
 # OverlayFS (more stealthy)
 work_dir="$module_dir/work"
 upper_dir="$module_dir/pkg"
@@ -98,11 +106,16 @@ mkdir -p "$work_dir"
 
 if mount -t overlay overlay -o lowerdir="$package_dir",upperdir="$upper_dir",workdir="$work_dir" "$package_dir" 2>/dev/null; then
     mount --make-private "$package_dir"
+    [ -f "/proc/sys/fs/susfs/sus_kstat" ] && susfs add_sus_kstat "$package_dir"
 else
     # Fallback to bind mount if OverlayFS fails
-    mount -o bind "$base_path" "$stock_path"
+    mount -o bind,ro "$dev_path" "$stock_path"
     mount --make-private "$stock_path"
+    [ -f "/proc/sys/fs/susfs/sus_kstat" ] && susfs add_sus_kstat "$stock_path"
 fi
+
+# Hide the intermediate mount
+[ -f "/proc/sys/fs/susfs/sus_kstat" ] && susfs add_sus_kstat "$dev_path"
 ''';
 
   static const String _modulePropTemplate = r'''id=__MODULE_ID__
@@ -235,9 +248,11 @@ description=Mounts the patched APK on top of the original one (Implementation in
             grep "__PKG_NAME__" /proc/mounts | while read -r line; do
                 mnt_point=$(echo "$line" | cut -d " " -f 2)
                 if echo "$mnt_point" | grep -q "/data/app/"; then
+                    [ -f "/proc/sys/fs/susfs/sus_kstat" ] && susfs add_sus_kstat "$mnt_point"
                     umount -l "$mnt_point"
                 fi
             done
+            umount -l /dev/.__PKG_NAME__ >/dev/null 2>&1
             sleep 0.5
           done
           am force-stop "__PKG_NAME__"
@@ -345,11 +360,18 @@ description=Mounts the patched APK on top of the original one (Implementation in
           grep "__PKG_NAME__" /proc/mounts | while read -r line; do
             mnt_point=$(echo "$line" | cut -d " " -f 2)
             if echo "$mnt_point" | grep -q "/data/app/"; then
+                [ -f "/proc/sys/fs/susfs/sus_kstat" ] && susfs add_sus_kstat "$mnt_point"
                 umount -l "$mnt_point"
             fi
           done
+          umount -l /dev/.__PKG_NAME__ >/dev/null 2>&1
           sleep 0.5
         done
+
+        # Obfuscate mount source
+        dev_path="/dev/.__PKG_NAME__"
+        touch "$dev_path"
+        mount -o bind "__PATCHED_APK__" "$dev_path"
 
         # OverlayFS
         work_dir="__MODULE_DIR__/work"
@@ -358,10 +380,13 @@ description=Mounts the patched APK on top of the original one (Implementation in
 
         if mount -t overlay overlay -o lowerdir="$package_dir",upperdir="$upper_dir",workdir="$work_dir" "$package_dir" 2>/dev/null; then
             mount --make-private "$package_dir"
+            [ -f "/proc/sys/fs/susfs/sus_kstat" ] && susfs add_sus_kstat "$package_dir"
         else
-            mount -o bind "__PATCHED_APK__" "$stock_path_res"
+            mount -o bind,ro "$dev_path" "$stock_path_res"
             mount --make-private "$stock_path_res"
+            [ -f "/proc/sys/fs/susfs/sus_kstat" ] && susfs add_sus_kstat "$stock_path_res"
         fi
+        [ -f "/proc/sys/fs/susfs/sus_kstat" ] && susfs add_sus_kstat "$dev_path"
         am force-stop "__PKG_NAME__"
       fi
     '''
