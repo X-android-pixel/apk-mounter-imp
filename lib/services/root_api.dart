@@ -20,22 +20,31 @@ base_dir="$module_dir"
 # log="$module_dir/log.txt"
 # exec >> "$log" 2>&1
 
-base_path="$base_dir/base.apk"
+base_path="$base_dir/pkg/base.apk"
 
 until [ "$(getprop sys.boot_completed)" = 1 ]; do sleep 3; done
 until [ -d "/sdcard/Android" ]; do sleep 1; done
 
-# Persistent unmount to ensure no stale mounts
-for i in 1 2 3; do
-  grep "$package_name" /proc/mounts | while read -r line; do
-    echo "$line" | cut -d " " -f 2 | sed "s/apk.*/apk/" | xargs -r umount -l
-  done
-  sleep 1
-done
+# Improved persistent unmount
+unmount_package() {
+    for i in 1 2 3; do
+        grep "$package_name" /proc/mounts | while read -r line; do
+            mnt_point=$(echo "$line" | cut -d " " -f 2)
+            # Match only relevant paths in /data/app/
+            if echo "$mnt_point" | grep -q "/data/app/"; then
+                umount -l "$mnt_point"
+            fi
+        done
+        sleep 0.5
+    done
+}
+
+unmount_package
 
 waited=0
 max_wait=180
 stock_path=""
+package_dir=""
 stock_versions=""
 while [ "$waited" -lt "$max_wait" ]; do
   stock_path_data="$(pm path "$package_name" | grep base | grep /data/app/ | head -n 1 | sed 's/package://g')"
@@ -46,6 +55,7 @@ while [ "$waited" -lt "$max_wait" ]; do
     stock_path_cmd=""
   fi
   stock_path="${stock_path_data:-${stock_path_fallback:-$stock_path_cmd}}"
+  package_dir="$(dirname "$stock_path")"
 
   stock_versions="$(dumpsys package "$package_name" | awk -v pkg="$package_name" '
     $0 ~ ("Package \\[" pkg "\\]") { in_pkg = 1 }
@@ -67,28 +77,32 @@ while [ "$waited" -lt "$max_wait" ]; do
   sleep 1
 done
 
-echo "base_path: $base_path"
-echo "stock_path: $stock_path"
-echo "base_version: $version"
-echo "stock_versions: $(echo "$stock_versions" | tr '\n' ' ' | xargs)"
-
 if ! echo "$stock_versions" | grep -Fxq "$version"; then
-  echo "Not mounting as versions don't match"
   exit 1
 fi
 
 if [ -z "$stock_path" ] || [ -z "$stock_versions" ]; then
-  echo "Not mounting as app info could not be loaded"
   exit 1
 fi
 
 if [ ! -f "$base_path" ]; then
-  echo "Not mounting as patched APK is missing: $base_path"
   exit 1
 fi
 
 chcon u:object_r:apk_data_file:s0 "$base_path"
-mount -o bind "$base_path" "$stock_path"
+
+# OverlayFS (more stealthy)
+work_dir="$module_dir/work"
+upper_dir="$module_dir/pkg"
+mkdir -p "$work_dir"
+
+if mount -t overlay overlay -o lowerdir="$package_dir",upperdir="$upper_dir",workdir="$work_dir" "$package_dir" 2>/dev/null; then
+    mount --make-private "$package_dir"
+else
+    # Fallback to bind mount if OverlayFS fails
+    mount -o bind "$base_path" "$stock_path"
+    mount --make-private "$stock_path"
+fi
 ''';
 
   static const String _modulePropTemplate = r'''id=__MODULE_ID__
@@ -216,10 +230,13 @@ description=Mounts the patched APK on top of the original one (Implementation in
     final String legacyPath = '$_modulesDirPath/$packageName-mounter';
 
     final String script = r'''
-          # Persistent unmount
+          # Improved persistent unmount
           for i in 1 2 3; do
             grep "__PKG_NAME__" /proc/mounts | while read -r line; do
-              echo "$line" | cut -d " " -f 2 | sed "s/apk.*/apk/" | xargs -r umount -l
+                mnt_point=$(echo "$line" | cut -d " " -f 2)
+                if echo "$mnt_point" | grep -q "/data/app/"; then
+                    umount -l "$mnt_point"
+                fi
             done
             sleep 0.5
           done
@@ -292,7 +309,9 @@ description=Mounts the patched APK on top of the original one (Implementation in
 
   Future<void> installPatchedApk(String packageName, String patchedFilePath) async {
     final String modulePath = _getModulePath(packageName);
-    final String newPatchedFilePath = '$modulePath/base.apk';
+    final String pkgDir = '$modulePath/pkg';
+    final String newPatchedFilePath = '$pkgDir/base.apk';
+    await Root.exec(cmd: 'mkdir -p "$pkgDir"');
     await Root.exec(
       cmd: 'cp "$patchedFilePath" "$newPatchedFilePath"',
     );
@@ -305,7 +324,8 @@ description=Mounts the patched APK on top of the original one (Implementation in
   }
 
   Future<void> runMountScript(String packageName) async {
-    final String patchedApk = '${_getModulePath(packageName)}/base.apk';
+    final String moduleDir = _getModulePath(packageName);
+    final String patchedApk = '$moduleDir/pkg/base.apk';
 
     final String script = r'''
       stock_path_data="$(pm path "__PKG_NAME__" | grep base | grep /data/app/ | head -n 1 | sed 's/package://g')"
@@ -316,20 +336,38 @@ description=Mounts the patched APK on top of the original one (Implementation in
         stock_path_cmd=""
       fi
       stock_path_res="${stock_path_data:-${stock_path_fallback:-$stock_path_cmd}}"
+      package_dir="$(dirname "$stock_path_res")"
 
       if [ -n "$stock_path_res" ] && [ -f "$stock_path_res" ]; then
         chcon u:object_r:apk_data_file:s0 "__PATCHED_APK__"
         # Persistent unmount to ensure no stale mounts before re-mounting
         for i in 1 2 3; do
           grep "__PKG_NAME__" /proc/mounts | while read -r line; do
-            echo "$line" | cut -d " " -f 2 | sed "s/apk.*/apk/" | xargs -r umount -l
+            mnt_point=$(echo "$line" | cut -d " " -f 2)
+            if echo "$mnt_point" | grep -q "/data/app/"; then
+                umount -l "$mnt_point"
+            fi
           done
           sleep 0.5
         done
-        mount -o bind "__PATCHED_APK__" "$stock_path_res"
+
+        # OverlayFS
+        work_dir="__MODULE_DIR__/work"
+        upper_dir="__MODULE_DIR__/pkg"
+        mkdir -p "$work_dir"
+
+        if mount -t overlay overlay -o lowerdir="$package_dir",upperdir="$upper_dir",workdir="$work_dir" "$package_dir" 2>/dev/null; then
+            mount --make-private "$package_dir"
+        else
+            mount -o bind "__PATCHED_APK__" "$stock_path_res"
+            mount --make-private "$stock_path_res"
+        fi
         am force-stop "__PKG_NAME__"
       fi
-    '''.replaceAll('__PKG_NAME__', packageName).replaceAll('__PATCHED_APK__', patchedApk);
+    '''
+        .replaceAll('__PKG_NAME__', packageName)
+        .replaceAll('__PATCHED_APK__', patchedApk)
+        .replaceAll('__MODULE_DIR__', moduleDir);
 
     await Root.exec(cmd: script);
   }
